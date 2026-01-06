@@ -1,11 +1,11 @@
 import streamlit as st
 import random
 import math
-import time
 import pandas as pd
 import uuid
+import time
 
-# --- GAME CONFIGURATION ---
+# --- CONFIGURATION ---
 MAX_FISH_CAPACITY = 2000
 BASE_FISH_PRICE = 5.0
 STARTING_CASH = 1000
@@ -16,24 +16,23 @@ BASELINE_DEMAND = 260
 CONTRACT_PRICE_MULT = 1.20
 CONTRACT_PENALTY_MULT = 2
 
-# --- PAGE SETUP ---
+# --- PAGE CONFIG ---
 st.set_page_config(
-    page_title="Fish Tycoon Online",
+    page_title="Fish Tycoon Multiplayer",
     page_icon="🐟",
     layout="centered",
     initial_sidebar_state="collapsed"
 )
 
-# --- CSS FOR MOBILE & UI ---
+# Custom CSS for cleaner look
 st.markdown("""
     <style>
-    .stButton>button {width: 100%; border-radius: 5px; height: 3em; font-weight: bold;}
-    .big-font {font-size:20px !important; font-weight: bold;}
-    .status-box {padding: 15px; border-radius: 10px; border: 1px solid #ddd; margin-bottom: 10px;}
+    .stButton>button {width: 100%; border-radius: 8px; height: 3em; font-weight: bold;}
+    .metric-card {background-color: #f0f2f6; padding: 15px; border-radius: 10px; border: 1px solid #ccc;}
     </style>
     """, unsafe_allow_html=True)
 
-# --- CLASSES ---
+# --- GAME LOGIC CLASSES ---
 class Event:
     def __init__(self, name, description, shore_mod=1.0, deep_mod=1.0, growth_mod=0.0):
         self.name = name
@@ -70,78 +69,74 @@ class Ocean:
     def reproduce(self):
         r_shore = 0.28 + self.current_event.growth_mod
         r_deep = 0.35 + self.current_event.growth_mod
-        self.fish_shore += r_shore * self.fish_shore * (1 - (self.fish_shore / (self.max_fish * 0.4)))
-        self.fish_deep += r_deep * self.fish_deep * (1 - (self.fish_deep / (self.max_fish * 0.6)))
-        self.fish_shore = max(0, self.fish_shore)
-        self.fish_deep = max(0, self.fish_deep)
+        
+        g_shore = r_shore * self.fish_shore * (1 - (self.fish_shore / (self.max_fish * 0.4)))
+        g_deep = r_deep * self.fish_deep * (1 - (self.fish_deep / (self.max_fish * 0.6)))
+        
+        self.fish_shore = max(0, self.fish_shore + g_shore)
+        self.fish_deep = max(0, self.fish_deep + g_deep)
 
-# --- GLOBAL STATE MANAGEMENT (The Server Brain) ---
+# --- SERVER STATE (The "Database") ---
 @st.cache_resource
 def get_server_state():
     return {
-        'phase': 'LOBBY',  # LOBBY, BRIEFING, ACTION, PROCESSING, RESULTS, GAMEOVER
         'ocean': Ocean(),
         'players': {},     # {uuid: {data}}
         'year': 1,
-        'max_years': 10,
+        'max_years': 5,    # Default, changed in Lobby
+        'phase': 'LOBBY',  # LOBBY, BRIEFING, SHIPYARD, FISHING, PROCESSING, SALES, RESULTS, GAMEOVER
         'market_price': BASE_FISH_PRICE,
         'contract': {},
-        'moves_buffer': {}, # Holds moves until everyone submits
-        'year_logs': []
+        'buffer': {},      # Stores temporary moves from players
+        'logs': []
     }
 
 game = get_server_state()
 
-# --- LOCAL SESSION MANAGEMENT (The Player Identity) ---
+# --- CLIENT STATE (The User) ---
 if 'user_id' not in st.session_state:
-    st.session_state.user_id = str(uuid.uuid4())[:8] # Generate unique ID for this browser
-if 'joined' not in st.session_state:
-    st.session_state.joined = False
+    st.session_state.user_id = str(uuid.uuid4())[:8]
 
 # --- HELPER FUNCTIONS ---
 def format_currency(val):
     return f"${val:,.0f}"
 
-def reset_year():
-    game['moves_buffer'] = {}
+def reset_year_logic():
+    game['buffer'] = {}
     game['year'] += 1
     game['phase'] = 'BRIEFING'
     game['ocean'].trigger_event()
     
     # Generate Contract
     avg_ships = sum(p['ships'] for p in game['players'].values()) / len(game['players'])
-    qty = max(25, int(avg_ships * 18 * random.uniform(0.8, 1.2)))
+    base_qty = avg_ships * 18
+    qty = max(25, int(random.uniform(base_qty * 0.7, base_qty * 1.1)))
     price = round(game['market_price'] * CONTRACT_PRICE_MULT, 2)
     game['contract'] = {'qty': qty, 'price': price}
 
-def process_turn():
-    # 1. Ship Purchasing
-    for pid, move in game['moves_buffer'].items():
-        p = game['players'][pid]
-        cost = move['buy_ships'] * SHIP_COST
-        if p['cash'] >= cost:
-            p['cash'] -= cost
-            p['ships'] += move['buy_ships']
-    
-    # 2. Fishing Calculation
-    total_shore_ships = sum(m['shore'] for m in game['moves_buffer'].values())
-    total_deep_ships = sum(m['deep'] for m in game['moves_buffer'].values())
+def process_fishing():
+    # This runs between Fishing and Sales phases
+    total_shore_ships = sum(m['shore'] for m in game['buffer'].values())
+    total_deep_ships = sum(m['deep'] for m in game['buffer'].values())
     
     ocean = game['ocean']
     evt = ocean.current_event
     
-    # Efficiency & Penalties
+    # Efficiency
     eff_shore = 0.035 * evt.shore_mod
     eff_deep = 0.055 * evt.deep_mod
+    
+    # Crowding
     shore_pen = 1.0 / (1 + max(0, total_shore_ships - 10) * 0.05)
     deep_pen = 1.0 / (1 + max(0, total_deep_ships - 10) * 0.05)
     
     pot_shore = min(ocean.fish_shore, ocean.fish_shore * eff_shore * total_shore_ships * shore_pen)
     pot_deep = min(ocean.fish_deep, ocean.fish_deep * eff_deep * total_deep_ships * deep_pen)
     
-    # Distribute Catch
     total_catch_mass = 0
-    for pid, move in game['moves_buffer'].items():
+    
+    # assign catch to players temp data
+    for pid, move in game['buffer'].items():
         p = game['players'][pid]
         
         s_share = (move['shore']/total_shore_ships)*pot_shore if total_shore_ships > 0 else 0
@@ -150,216 +145,284 @@ def process_turn():
         caught = s_share + d_share
         total_catch_mass += caught
         
-        # 3. Inventory & Sales
-        old_freezer = p['freezer']
-        total_avail = caught + old_freezer
+        # Deduct Operation Costs immediately
+        op_costs = (move['shore']*45) + (move['deep']*60) + (move['harbor']*5)
+        p['cash'] -= op_costs
         
-        # Handle freezing request
-        # If they asked to freeze more than they have, cap it
-        actual_freeze = min(move['freeze_req'], total_avail)
-        to_sell = total_avail - actual_freeze
+        # Store catch in player object for the Sales Phase
+        p['current_catch'] = caught
+        p['accepted_contract'] = move['contract']
+    
+    # Update Ecology
+    ocean.fish_shore = max(0, ocean.fish_shore - pot_shore)
+    ocean.fish_deep = max(0, ocean.fish_deep - pot_deep)
+    
+    # Update Market Price Dynamic
+    k = 0.005
+    diff = BASELINE_DEMAND - total_catch_mass
+    mult = math.exp(k * diff)
+    new_price = max(1.0, min(15.0, BASE_FISH_PRICE * mult))
+    game['market_price'] = new_price # Price updates BEFORE sales
+    
+    # Reset buffer for Sales Phase
+    game['buffer'] = {} 
+    game['phase'] = 'SALES'
+
+def process_sales():
+    for pid, move in game['buffer'].items():
+        p = game['players'][pid]
         
-        # Contract Logic
+        to_freeze = move['freeze']
+        to_sell = move['sell']
+        
+        # Storage Cost
+        storage_bill = to_freeze * STORAGE_COST
+        p['cash'] -= storage_bill
+        p['freezer'] = to_freeze # Set new inventory
+        
         revenue = 0
         penalty = 0
-        if move['accept_contract']:
+        
+        # Contract Logic
+        if p['accepted_contract']:
             req = game['contract']['qty']
             delivered = min(req, to_sell)
             revenue += delivered * game['contract']['price']
             to_sell -= delivered
+            
             if delivered < req:
                 penalty = (req - delivered) * game['contract']['price'] * CONTRACT_PENALTY_MULT
-        
+                p['cash'] -= penalty
+                
         # Market Sales
         revenue += to_sell * game['market_price']
+        p['cash'] += revenue
         
-        # Costs
-        storage_bill = actual_freeze * STORAGE_COST
-        op_costs = (move['shore']*45) + (move['deep']*60) + (move['harbor']*5)
-        
-        # Final Updates
-        profit = revenue - (storage_bill + op_costs + penalty)
-        p['cash'] += profit # (Profit is net change)
-        p['freezer'] = actual_freeze
-        p['last_profit'] = profit
-        p['last_catch'] = caught
+        # Stats
+        p['last_profit'] = revenue - (storage_bill + penalty) # simplified profit view
         p['last_penalty'] = penalty
-    
-    # 4. Ecology & Market Update
-    ocean.fish_shore = max(0, ocean.fish_shore - pot_shore)
-    ocean.fish_deep = max(0, ocean.fish_deep - pot_deep)
-    
-    k = 0.005
-    diff = BASELINE_DEMAND - total_catch_mass
-    mult = math.exp(k * diff)
-    game['market_price'] = max(1.0, min(15.0, BASE_FISH_PRICE * mult))
-    
+        
+    ocean = game['ocean']
     ocean.reproduce()
+    
+    game['buffer'] = {}
     game['phase'] = 'RESULTS'
 
 # ================= UI LOGIC =================
 
-st.title("🐟 Fish Tycoon: Online")
+st.title("🐟 Fish Tycoon: Multiplayer")
 
-# --- 1. LOBBY PHASE ---
+# --- 1. LOBBY ---
 if game['phase'] == 'LOBBY':
-    if not st.session_state.joined:
-        st.subheader("Join Game")
-        name = st.text_input("Enter Captain Name")
-        if st.button("Enter Lobby"):
-            if name:
+    st.subheader("Lobby")
+    
+    if not st.session_state.get('joined'):
+        with st.form("join_form"):
+            name = st.text_input("Enter Captain Name")
+            submitted = st.form_submit_button("Join Game")
+            if submitted and name:
                 game['players'][st.session_state.user_id] = {
-                    'name': name, 'cash': STARTING_CASH, 'ships': 3,
-                    'freezer': 0, 'last_profit': 0, 'last_catch': 0, 'last_penalty': 0
+                    'name': name, 'cash': STARTING_CASH, 'ships': 3, 
+                    'freezer': 0, 'last_profit': 0, 'current_catch': 0, 'accepted_contract': False
                 }
                 st.session_state.joined = True
                 st.rerun()
     else:
-        st.success(f"Welcome, Captain {game['players'][st.session_state.user_id]['name']}!")
-        st.write("### Waiting Room")
+        st.success(f"Joined as {game['players'][st.session_state.user_id]['name']}")
         
-        players_list = list(game['players'].values())
-        df = pd.DataFrame(players_list)
-        if not df.empty:
-            st.table(df[['name']])
-            
-        st.write("Wait for the Admin to start the game.")
-        
-        # Admin Controls (First player is admin implicitly, or anyone can start for simplicity)
+        # Admin Settings
         if len(game['players']) > 0:
-            if st.button("👑 START GAME (Admin)"):
-                game['ocean'].trigger_event()
-                # Initial Contract
-                qty = 40
-                price = round(game['market_price'] * CONTRACT_PRICE_MULT, 2)
-                game['contract'] = {'qty': qty, 'price': price}
-                game['phase'] = 'BRIEFING'
-                st.rerun()
+            st.write("---")
+            st.write("### Game Settings")
+            # Only let the first player change settings to avoid chaos
+            first_player_id = list(game['players'].keys())[0]
+            if st.session_state.user_id == first_player_id:
+                yrs = st.number_input("Game Duration (Years)", 1, 20, 5)
+                if st.button("👑 START GAME"):
+                    game['max_years'] = yrs
+                    game['ocean'].trigger_event()
+                    # Init contract
+                    avg_ships = 3
+                    qty = int(avg_ships * 18)
+                    price = round(game['market_price'] * CONTRACT_PRICE_MULT, 2)
+                    game['contract'] = {'qty': qty, 'price': price}
+                    game['phase'] = 'BRIEFING'
+                    st.rerun()
+            else:
+                st.info(f"Waiting for host to start ({game['max_years']} years)...")
         
+        st.write("### Captains List")
+        for pid, p in game['players'].items():
+            st.write(f"⚓ {p['name']}")
+            
         if st.button("Refresh Lobby"):
             st.rerun()
 
-# --- 2. BRIEFING PHASE (Year Start) ---
+# --- 2. BRIEFING (Year Start) ---
 elif game['phase'] == 'BRIEFING':
-    st.header(f"📅 Year {game['year']} Briefing")
+    st.header(f"📅 Year {game['year']} of {game['max_years']}")
     
-    # Public Info
-    col1, col2 = st.columns(2)
-    with col1:
+    # Event & Ecology Data (Req #4)
+    c1, c2 = st.columns(2)
+    with c1:
         st.info(f"**Event:** {game['ocean'].current_event.name}\n\n{game['ocean'].current_event.description}")
-    with col2:
-        st.metric("Market Price", format_currency(game['market_price']))
-        st.metric("Ship Value", format_currency(game['ocean'].get_ship_market_price()))
-        
-    contract = game['contract']
-    st.warning(f"📜 **CONTRACT:** Deliver {contract['qty']} fish @ {format_currency(contract['price'])}")
+    with c2:
+        st.metric("Shore Population", int(game['ocean'].fish_shore))
+        st.metric("Deep Population", int(game['ocean'].fish_deep))
     
-    if st.button("GO TO STRATEGY ROOM"):
-        game['phase'] = 'ACTION'
+    st.write("---")
+    st.write("### Market Outlook")
+    m1, m2 = st.columns(2)
+    m1.metric("Current Fish Price", format_currency(game['market_price']))
+    m2.metric("Ship Market Value", format_currency(game['ocean'].get_ship_market_price()))
+    
+    if st.button("Go to Shipyard"):
+        game['phase'] = 'SHIPYARD'
         st.rerun()
 
-# --- 3. ACTION PHASE (Private) ---
-elif game['phase'] == 'ACTION':
-    # Check if this specific user has submitted
+# --- 3. SHIPYARD (Auction/Buy Phase - Req #3) ---
+elif game['phase'] == 'SHIPYARD':
     my_id = st.session_state.user_id
-    
-    if my_id not in game['players']:
-        st.error("You are not in this game. Please refresh or rejoin.")
-        st.stop()
+    if my_id in game['buffer']:
+        st.info("✅ Ship orders submitted. Waiting for others...")
+        if len(game['buffer']) == len(game['players']):
+            # Apply ship orders instantly
+            for pid, qty in game['buffer'].items():
+                cost = qty * SHIP_COST
+                game['players'][pid]['cash'] -= cost
+                game['players'][pid]['ships'] += qty
+            
+            game['buffer'] = {}
+            game['phase'] = 'FISHING'
+            st.rerun()
+        else:
+            if st.button("Refresh"): st.rerun()
+            
+    else:
+        st.header("🏗️ The Shipyard")
+        p = game['players'][my_id]
+        st.metric("Your Cash", format_currency(p['cash']))
         
-    if my_id in game['moves_buffer']:
-        # WAITING SCREEN
-        st.info("✅ Strategy Submitted.")
-        st.write(f"Waiting for other captains... ({len(game['moves_buffer'])}/{len(game['players'])})")
+        st.write(f"New ships cost **{format_currency(SHIP_COST)}**.")
+        max_buy = int(p['cash'] // SHIP_COST)
         
-        # Check if everyone is ready
-        if len(game['moves_buffer']) == len(game['players']):
-            if st.button("CALCULATE RESULTS"):
-                process_turn()
+        with st.form("ship_form"):
+            qty = st.number_input(f"How many ships to buy? (Max {max_buy})", 0, max_buy, 0)
+            if st.form_submit_button("Confirm Orders"):
+                game['buffer'][my_id] = qty
+                st.rerun()
+
+# --- 4. FISHING STRATEGY ---
+elif game['phase'] == 'FISHING':
+    my_id = st.session_state.user_id
+    if my_id in game['buffer']:
+        st.info("✅ Fleet deployed. Waiting for other captains...")
+        if len(game['buffer']) == len(game['players']):
+            # All deployed, calculate results
+            if st.button("Start Simulation"):
+                process_fishing() # This moves to SALES phase
                 st.rerun()
         else:
-            if st.button("Refresh Status"):
-                st.rerun()
-                
+            if st.button("Refresh"): st.rerun()
     else:
-        # INPUT SCREEN (Private)
-        me = game['players'][my_id]
+        st.header("⚓ Fleet Command")
+        p = game['players'][my_id]
         
-        st.subheader(f"Captain {me['name']}'s Console")
+        # Contract Display
+        contract = game['contract']
+        st.warning(f"📜 **CONTRACT:** Deliver {contract['qty']} fish @ {format_currency(contract['price'])}")
         
-        # Dashboard
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Cash", format_currency(me['cash']))
-        c2.metric("Fleet", me['ships'])
-        c3.metric("Freezer", me['freezer'])
-        
-        with st.form("strategy_form"):
-            st.markdown("### 1. Shipyard")
-            max_buy = int(me['cash'] // SHIP_COST)
-            buy_ships = st.number_input(f"Buy Ships (${SHIP_COST})", 0, max_buy, 0)
+        with st.form("fish_form"):
+            st.write(f"You have **{p['ships']} ships** available.")
             
-            st.markdown("### 2. Allocation")
-            total_ships = me['ships'] + buy_ships
-            st.caption(f"Total Ships Available: {total_ships}")
+            c1, c2 = st.columns(2)
+            with c1:
+                shore = st.number_input("Ships to Shore ($45)", 0, p['ships'], 0)
+            with c2:
+                rem = p['ships'] - shore
+                deep = st.number_input("Ships to Deep ($60)", 0, rem, 0)
             
-            c_shore, c_deep = st.columns(2)
-            with c_shore:
-                s_alloc = st.number_input("To Shore ($45)", 0, total_ships, 0)
-            with c_deep:
-                remaining = total_ships - s_alloc
-                d_alloc = st.number_input("To Deep ($60)", 0, remaining, 0)
+            harbor = p['ships'] - shore - deep
+            st.caption(f"Ships in Harbor ($5): {harbor}")
             
-            h_alloc = total_ships - s_alloc - d_alloc
-            st.caption(f"Harbor: {h_alloc} ($5)")
+            accept = st.checkbox("Accept Contract? (Penalty applies if failed)")
             
-            st.markdown("### 3. Sales & Storage")
-            st.caption("Enter how much you want to KEEP. The rest will be sold.")
-            freeze_req = st.number_input(f"Target Freezer Stock (Cost ${STORAGE_COST}/unit)", 0, 5000, 0)
+            est_cost = (shore*45) + (deep*60) + (harbor*5)
+            st.write(f"**Operational Cost:** {format_currency(est_cost)}")
             
-            st.markdown("### 4. Contracts")
-            accept = st.checkbox(f"Accept Contract? (Deliver {game['contract']['qty']})")
-            
-            # Validation Cost Check
-            est_cost = (buy_ships*SHIP_COST) + (s_alloc*45) + (d_alloc*60) + (h_alloc*5)
-            st.write(f"**Upfront Cost:** {format_currency(est_cost)}")
-            
-            submitted = st.form_submit_button("SUBMIT ORDERS")
-            
-            if submitted:
-                if est_cost > me['cash']:
-                    st.error("Insufficient Cash for these orders!")
+            if st.form_submit_button("Deploy Fleet"):
+                if est_cost > p['cash']:
+                    st.error("Insufficient funds for fuel/crew!")
                 else:
-                    game['moves_buffer'][my_id] = {
-                        'buy_ships': buy_ships,
-                        'shore': s_alloc,
-                        'deep': d_alloc,
-                        'harbor': h_alloc,
-                        'freeze_req': freeze_req,
-                        'accept_contract': accept
+                    game['buffer'][my_id] = {
+                        'shore': shore, 'deep': deep, 'harbor': harbor, 'contract': accept
                     }
                     st.rerun()
 
-# --- 4. RESULTS PHASE (Public Leaderboard) ---
+# --- 5. SALES & STORAGE (Req #2) ---
+elif game['phase'] == 'SALES':
+    my_id = st.session_state.user_id
+    
+    if my_id in game['buffer']:
+        st.info("✅ Sales finalized. Waiting for market close...")
+        if len(game['buffer']) == len(game['players']):
+            if st.button("View Results"):
+                process_sales()
+                st.rerun()
+        else:
+            if st.button("Refresh"): st.rerun()
+    else:
+        st.header("❄️ Cold Storage & Sales")
+        p = game['players'][my_id]
+        
+        # Calculate totals
+        fresh_catch = p['current_catch']
+        old_stock = p['freezer']
+        total_avail = fresh_catch + old_stock
+        
+        st.success(f"**Market Price Update:** Fish is now trading at **{format_currency(game['market_price'])}**")
+        
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Fresh Catch", int(fresh_catch))
+        c2.metric("Freezer Stock", int(old_stock))
+        c3.metric("Total Available", int(total_avail))
+        
+        with st.form("sales_form"):
+            st.write(f"Storage Cost: **{format_currency(STORAGE_COST)} / unit**")
+            
+            keep = st.number_input("How many units to FREEZE? (Rest will be sold)", 0, int(total_avail), 0)
+            
+            sell_amt = total_avail - keep
+            est_rev = sell_amt * game['market_price']
+            est_store_cost = keep * STORAGE_COST
+            
+            st.write(f"You will sell **{int(sell_amt)}** units.")
+            st.caption(f"Est. Revenue: {format_currency(est_rev)} | Storage Bill: {format_currency(est_store_cost)}")
+            
+            if st.form_submit_button("Confirm Sales"):
+                if est_store_cost > p['cash']:
+                    st.error("Not enough cash to pay storage fees!")
+                else:
+                    game['buffer'][my_id] = {
+                        'freeze': keep, 'sell': sell_amt
+                    }
+                    st.rerun()
+
+# --- 6. RESULTS ---
 elif game['phase'] == 'RESULTS':
     st.header(f"🏆 Year {game['year']} Results")
     
-    # Leaderboard
     data = []
     for pid, p in game['players'].items():
         data.append({
-            'Captain': p['name'],
-            'Profit': format_currency(p['last_profit']),
-            'Total Cash': format_currency(p['cash']),
-            'Catch': int(p['last_catch']),
+            'Player': p['name'],
+            'Cash': format_currency(p['cash']),
             'Freezer': int(p['freezer']),
-            'Penalty': format_currency(p['last_penalty']) if p['last_penalty'] > 0 else "-"
+            'Ships': p['ships']
         })
     
-    df = pd.DataFrame(data).sort_values(by="Total Cash", ascending=False)
+    df = pd.DataFrame(data).sort_values(by="Cash", ascending=False)
     st.table(df)
-    
-    st.write("---")
-    st.metric("New Market Price", format_currency(game['market_price']))
     
     if game['year'] >= game['max_years']:
         if st.button("END GAME"):
@@ -367,30 +430,29 @@ elif game['phase'] == 'RESULTS':
             st.rerun()
     else:
         if st.button("START NEXT YEAR"):
-            reset_year()
+            reset_year_logic()
             st.rerun()
 
-# --- 5. GAMEOVER ---
+# --- 7. GAMEOVER ---
 elif game['phase'] == 'GAMEOVER':
     st.balloons()
     st.title("GAME OVER")
     
     ship_val = game['ocean'].get_ship_market_price()
-    st.write(f"Final Ship Liquidation Value: {format_currency(ship_val)}")
+    st.write(f"Ship Liquidation Value: {format_currency(ship_val)}")
     
-    final_data = []
+    final = []
     for pid, p in game['players'].items():
         wealth = p['cash'] + (p['ships'] * ship_val)
-        final_data.append({
-            'Captain': p['name'],
+        final.append({
+            'Player': p['name'],
             'Final Wealth': format_currency(wealth),
             'Cash': format_currency(p['cash']),
             'Fleet': p['ships']
         })
-        
-    df = pd.DataFrame(final_data).sort_values(by="Final Wealth", ascending=False)
-    st.table(df)
     
-    if st.button("RESET SERVER (Delete All Data)"):
+    st.table(pd.DataFrame(final).sort_values(by="Final Wealth", ascending=False))
+    
+    if st.button("Reset Server"):
         st.cache_resource.clear()
         st.rerun()
